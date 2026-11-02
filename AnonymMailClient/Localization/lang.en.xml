@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<strings>
+  <LanguageName>English</LanguageName>
+  <s name="AppTitle">Example App</s>
+  <s name="AppDescription">Application description</s>
+  <s name="SettingLanguage">Language</s>
+  <s name="LanguageSystem">Follow Windows</s>
+  <s name="SettingsTitle">Settings</s>
+  <s name="SettingExampleText">Example text setting</s>
+  <s name="SettingExampleNumber">Example number setting</s>
+  <s name="SettingExampleEnabled">Example feature enabled</s>
+  <s name="SettingsSaved">Settings saved.</s>
+  <s name="ButtonSave">Save</s>
+  <s name="ButtonCancel">Cancel</s>
+  <s name="ButtonRetry">Retry</s>
+  <s name="ButtonClose">Close</s>
+  <s name="ButtonOpenFolder">Open folder</s>
+  <s name="StatusReady">Ready</s>
+  <s name="StatusWorking">Operation in progress.</s>
+  <s name="StatusCompleted">Operation completed.</s>
+  <s name="StatusCanceled">Operation canceled.</s>
+  <s name="StatusFailed">The operation could not be completed.</s>
+  <s name="ProgressItems">Processed {0} / {1} items.</s>
+  <s name="ExampleMultiline">First line\nSecond line</s>
+</strings>
