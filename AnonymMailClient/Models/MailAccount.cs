@@ -6,10 +6,13 @@ namespace AnonymMailClient.Models;
 public sealed class MailAccount
 {
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Provider { get; set; } = "guerrilla"; // "guerrilla" | "mailtm"
     public string EmailAddress { get; set; } = string.Empty;
     public string Username { get; set; } = string.Empty;
     public string Domain { get; set; } = "sharklasers.com";
     public string SidToken { get; set; } = string.Empty;
+    public string? Password { get; set; }
+    public string? RemoteAccountId { get; set; }
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
     public DateTime? LastCheckedUtc { get; set; }
     public int UnreadCount { get; set; }

@@ -593,11 +593,26 @@ public sealed class MainForm : Form
             g.FillRectangle(barBrush, new Rectangle(e.Bounds.X, e.Bounds.Y, 3, e.Bounds.Height));
         }
 
+        // Provider Badge
+        bool isMailTm = string.Equals(item.Account.Provider, "mailtm", StringComparison.OrdinalIgnoreCase);
+        string providerTag = isMailTm ? "TM" : "GM";
+        Color tagColor = isMailTm ? AccentCyan : AccentGreen;
+
+        using (var tagFont = new Font("Segoe UI", 7F, FontStyle.Bold))
+        using (var tagBrush = new SolidBrush(tagColor))
+        using (var tagBg = new SolidBrush(Color.FromArgb(35, tagColor.R / 4, tagColor.G / 4, tagColor.B / 4)))
+        {
+            var tagRect = new Rectangle(e.Bounds.X + 10, e.Bounds.Y + 13, 24, 16);
+            g.FillRoundedRectangle(tagBg, tagRect, 4);
+            var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            g.DrawString(providerTag, tagFont, tagBrush, tagRect, sf);
+        }
+
         // Email Text
         using (var font = new Font(Font, isSelected ? FontStyle.Bold : FontStyle.Regular))
         using (var textBrush = new SolidBrush(isSelected ? Color.White : TextPrimary))
         {
-            var textRect = new Rectangle(e.Bounds.X + 12, e.Bounds.Y + 11, e.Bounds.Width - 65, e.Bounds.Height - 11);
+            var textRect = new Rectangle(e.Bounds.X + 40, e.Bounds.Y + 11, e.Bounds.Width - 95, e.Bounds.Height - 11);
             g.DrawString(item.Account.EmailAddress, font, textBrush, textRect, new StringFormat { Trimming = StringTrimming.EllipsisCharacter });
         }
 
@@ -748,7 +763,8 @@ public sealed class MainForm : Form
         if (lstAccounts.SelectedItem is AccountListItem item)
         {
             selectedAccount = item.Account;
-            lblCurrentAccount.Text = selectedAccount.EmailAddress;
+            string providerName = string.Equals(selectedAccount.Provider, "mailtm", StringComparison.OrdinalIgnoreCase) ? "Mail.tm" : "Guerrilla Mail";
+            lblCurrentAccount.Text = $"{selectedAccount.EmailAddress} ({providerName})";
             lblLastCheck.Text = selectedAccount.LastCheckedUtc.HasValue
                 ? $"Checked: {selectedAccount.LastCheckedUtc.Value.ToLocalTime():HH:mm:ss}"
                 : "Not checked yet";
@@ -810,7 +826,7 @@ public sealed class MainForm : Form
             {
                 try
                 {
-                    var detailed = await GuerrillaMailService.FetchMessageDetailAsync(selectedAccount, msg.Id);
+                    var detailed = await MailAccountService.FetchMessageDetailAsync(selectedAccount, msg.Id);
                     MessageCacheStore.UpsertMessage(selectedAccount.Id, detailed);
                     if (selectedMessage?.Id == msg.Id)
                         txtDetailBody.Text = detailed.BodyText;
@@ -848,7 +864,7 @@ public sealed class MainForm : Form
         btnRefreshAccount.Text = "Refreshing...";
         try
         {
-            var remoteMsgs = await GuerrillaMailService.CheckMessagesAsync(selectedAccount);
+            var remoteMsgs = await MailAccountService.CheckMessagesAsync(selectedAccount);
             foreach (var m in remoteMsgs)
                 MessageCacheStore.UpsertMessage(selectedAccount.Id, m);
 

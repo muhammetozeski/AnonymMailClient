@@ -39,28 +39,33 @@ static class Program
         Console.WriteLine("=== AnonymMailClient E2E Tor Test ===");
         try
         {
-            Console.WriteLine("[1/4] Bootstrapping Tor...");
+            Console.WriteLine("[1/5] Bootstrapping Tor...");
             var endpoint = await TorService.RequireEndpointAsync(CancellationToken.None);
-            Console.WriteLine($"[1/4] Tor Ready: {endpoint}");
+            Console.WriteLine($"[1/5] Tor Ready: {endpoint}");
 
-            Console.WriteLine("[2/4] Provisioning Guerrilla Mail account over Tor...");
+            Console.WriteLine("[2/5] Provisioning Guerrilla Mail account over Tor...");
             string testUser = "tst" + Random.Shared.Next(100000, 999999);
             var acc = await GuerrillaMailService.CreateCustomAccountAsync(testUser, "sharklasers.com");
-            Console.WriteLine($"[2/4] Account Created: {acc.EmailAddress} (sid: {acc.SidToken})");
+            Console.WriteLine($"[2/5] Guerrilla Account Created: {acc.EmailAddress}");
 
-            Console.WriteLine("[3/4] Checking inbox over Tor...");
-            var msgs = await GuerrillaMailService.CheckMessagesAsync(acc);
-            Console.WriteLine($"[3/4] Inbox checked: {msgs.Count} message(s) found.");
+            Console.WriteLine("[3/5] Provisioning Mail.tm account over Tor...");
+            var mailTmAcc = await MailTmService.CreateAccountAsync(null, null);
+            Console.WriteLine($"[3/5] Mail.tm Account Created: {mailTmAcc.EmailAddress}");
 
-            Console.WriteLine("[4/4] Sending Direct-to-MX email over Tor to Guerrilla Mail...");
+            Console.WriteLine("[4/5] Checking inboxes over Tor...");
+            var gmMsgs = await MailAccountService.CheckMessagesAsync(acc);
+            var tmMsgs = await MailAccountService.CheckMessagesAsync(mailTmAcc);
+            Console.WriteLine($"[4/5] Inboxes checked: GM={gmMsgs.Count}, TM={tmMsgs.Count}");
+
+            Console.WriteLine("[5/5] Sending Direct-to-MX email over Tor to Mail.tm...");
             await DirectMxSmtpService.SendAsync(
                 acc,
-                acc.EmailAddress,
-                "AnonymMailClient Self-Test",
-                "This is an automated E2E test verifying Direct-to-MX delivery over Tor.",
+                mailTmAcc.EmailAddress,
+                "AnonymMailClient E2E Test",
+                "Automated Tor delivery test to Mail.tm.",
                 isHtml: false,
                 onProgress: msg => Console.WriteLine($"   > {msg}"));
-            Console.WriteLine("[4/4] Direct-to-MX delivery over Tor succeeded!");
+            Console.WriteLine("[5/5] Direct-to-MX delivery over Tor succeeded!");
 
             Console.WriteLine("=== ALL TESTS PASSED SUCCESSFULLY! ===");
             return 0;

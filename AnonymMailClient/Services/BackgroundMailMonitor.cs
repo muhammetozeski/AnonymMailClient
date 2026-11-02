@@ -65,7 +65,7 @@ public static class BackgroundMailMonitor
                     var existing = MessageCacheStore.LoadMessages(account.Id);
                     var existingIds = existing.Select(m => m.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-                    var remoteItems = await GuerrillaMailService.CheckMessagesAsync(account);
+                    var remoteItems = await MailAccountService.CheckMessagesAsync(account);
                     var newItems = new List<MailMessageSummary>();
 
                     foreach (var item in remoteItems)
