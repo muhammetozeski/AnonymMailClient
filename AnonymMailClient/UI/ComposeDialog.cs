@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using AnonymMailClient.Models;
 using AnonymMailClient.Services;
 using AnonymMailClient.Storage;
@@ -6,6 +7,9 @@ namespace AnonymMailClient.UI;
 
 public sealed class ComposeDialog : Form
 {
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
     readonly ComboBox cmbSender;
     readonly TextBox txtRecipient;
     readonly TextBox txtSubject;
@@ -25,9 +29,22 @@ public sealed class ComposeDialog : Form
         Size = new Size(680, 560);
         MinimumSize = new Size(540, 440);
         StartPosition = FormStartPosition.CenterParent;
-        BackColor = Color.FromArgb(24, 24, 27);
+        BackColor = Color.FromArgb(24, 24, 30);
         ForeColor = Color.FromArgb(240, 240, 245);
         Font = new Font("Segoe UI", 9.5F, FontStyle.Regular);
+
+        HandleCreated += (_, _) =>
+        {
+            try
+            {
+                if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 17763))
+                {
+                    int dm = 1;
+                    DwmSetWindowAttribute(Handle, 20, ref dm, sizeof(int));
+                }
+            }
+            catch { }
+        };
 
         var accounts = AccountStore.LoadAccounts();
 

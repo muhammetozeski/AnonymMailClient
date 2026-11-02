@@ -9,6 +9,7 @@ namespace AnonymMailClient;
 internal static class ApplicationServices
 {
     const bool IsLogEnabled = true;
+    static readonly string ConfigPath = Path.Combine(AppPaths.UserData, ConfigFileName);
     static readonly object InitializationLock = new();
     static bool Initialized;
 
@@ -22,7 +23,7 @@ internal static class ApplicationServices
                 return;
 
             Directory.CreateDirectory(AppPaths.UserData);
-            SettingsManager.LoadSettings(ConfigFileName);
+            SettingsManager.LoadSettings(ConfigPath);
             Logger.ActivateLogging = Settings.EnableLogging.Value;
             LocManager.Init(Settings.Language.Value);
             SettingsManagerSettings.IsTurkish = LocManager.Current == "tr";
@@ -40,10 +41,10 @@ internal static class ApplicationServices
     public static OperationResult<bool> SaveSettings() => RunSafely(() =>
     {
         Directory.CreateDirectory(AppPaths.UserData);
-        SettingsManager.SaveSettings(ConfigFileName);
+        SettingsManager.SaveSettings(ConfigPath);
         Logger.ActivateLogging = Settings.EnableLogging.Value;
         if (IsLogEnabled)
-            Log($"Settings saved; path={ConfigFileName}; count={SettingsManager.GetAllSettings().Length}", isRun: IsLogEnabled);
+            Log($"Settings saved; path={ConfigPath}; count={SettingsManager.GetAllSettings().Length}", isRun: IsLogEnabled);
     });
 
     /// <summary>Applies a complete language file and optionally saves the preference for the next launch.</summary>

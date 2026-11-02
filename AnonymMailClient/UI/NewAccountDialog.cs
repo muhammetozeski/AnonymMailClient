@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using AnonymMailClient.Models;
 using AnonymMailClient.Services;
 using AnonymMailClient.Tor;
@@ -6,6 +7,9 @@ namespace AnonymMailClient.UI;
 
 public sealed class NewAccountDialog : Form
 {
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
     readonly RadioButton rbRandom;
     readonly RadioButton rbCustom;
     readonly TextBox txtUsername;
@@ -25,9 +29,22 @@ public sealed class NewAccountDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
-        BackColor = Color.FromArgb(24, 24, 27);
+        BackColor = Color.FromArgb(24, 24, 30);
         ForeColor = Color.FromArgb(240, 240, 245);
         Font = new Font("Segoe UI", 10F, FontStyle.Regular);
+
+        HandleCreated += (_, _) =>
+        {
+            try
+            {
+                if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 17763))
+                {
+                    int dm = 1;
+                    DwmSetWindowAttribute(Handle, 20, ref dm, sizeof(int));
+                }
+            }
+            catch { }
+        };
 
         var lblTitle = new Label
         {

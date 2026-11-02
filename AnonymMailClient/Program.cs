@@ -22,7 +22,15 @@ static class Program
             Log($"Application initialization warning: {initResult.Error?.Message}", LogLevel.Warning);
         }
 
-        Application.Run(new MainForm());
+        try
+        {
+            Application.Run(new MainForm());
+        }
+        catch (Exception ex)
+        {
+            Log($"Unhandled application exception: {ex}", LogLevel.Critical);
+            MessageBox.Show(ex.ToString(), "AnonymMailClient Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
         return 0;
     }
 

@@ -41,11 +41,10 @@ $targetExe = Join-Path $DeployRoot "AnonymMailClient.exe"
 $sourcePortable = Join-Path $portableDir "AnonymMailClient.exe"
 
 # If the deployed application is currently running, terminate it before updating
-$runningProcs = @(Get-Process | Where-Object { $_.ProcessName -eq 'AnonymMailClient' -and $_.Path -and $_.Path.StartsWith($DeployRoot, [StringComparison]::OrdinalIgnoreCase) })
+$runningProcs = @(Get-Process -Name 'AnonymMailClient' -ErrorAction SilentlyContinue)
 foreach ($p in $runningProcs) {
     Write-Host "Stopping running instance (PID $($p.Id))..." -ForegroundColor Yellow
-    $p.Kill()
-    $p.WaitForExit(3000)
+    try { $p.Kill(); $p.WaitForExit(3000) } catch { }
 }
 
 Copy-Item $sourcePortable $targetExe -Force
