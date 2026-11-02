@@ -22,20 +22,50 @@ public static class DirectMxSmtpService
         "https://dns.google/resolve"
     ];
 
-    public static string SanitizeMessageForAnonymity(MailAccount account, MimeMessage message)
+    public static string SanitizeMessageForAnonymity(MimeMessage message, string fallbackDomain)
     {
-        if (message.From.Count == 0)
-            message.From.Add(new MailboxAddress(account.Username, account.EmailAddress));
+        string senderEmail = message.From.Mailboxes.FirstOrDefault()?.Address ?? "";
+        string senderDomain = ExtractDomain(senderEmail, fallbackDomain);
+        if (string.IsNullOrWhiteSpace(senderDomain)) senderDomain = "localhost";
 
-        string senderEmail = message.From.Mailboxes.FirstOrDefault()?.Address ?? account.EmailAddress;
-        string senderDomain = ExtractDomain(senderEmail, account.Domain);
-
+        // UTC Date with zero offset (prevents timezone leakage)
         message.Date = new DateTimeOffset(DateTime.UtcNow, TimeSpan.Zero);
+
+        // Cryptographically clean Message-ID with sender domain (prevents machine/local info leakage)
         message.MessageId = $"{Guid.NewGuid():N}@{senderDomain}";
 
+        // Scrub all tracking and fingerprinting headers
         message.Headers.RemoveAll(HeaderId.XMailer);
         message.Headers.RemoveAll(HeaderId.UserAgent);
+        message.Headers.RemoveAll(HeaderId.Received);
         message.Headers.RemoveAll("X-Originating-IP");
+        message.Headers.RemoveAll("X-Sender");
+        message.Headers.RemoveAll("X-Sender-IP");
+        message.Headers.RemoveAll("X-Client-IP");
+        message.Headers.RemoveAll("X-Received");
+        message.Headers.RemoveAll("X-Originating-Email");
+        message.Headers.RemoveAll("X-PHP-Originating-Script");
+
+        // Scrub attachment metadata: clean filename and strip local file timestamps
+        foreach (var part in message.BodyParts.OfType<MimePart>())
+        {
+            if (part.ContentDisposition != null)
+            {
+                if (!string.IsNullOrEmpty(part.ContentDisposition.FileName))
+                    part.ContentDisposition.FileName = Path.GetFileName(part.ContentDisposition.FileName);
+
+                part.ContentDisposition.CreationDate = null;
+                part.ContentDisposition.ModificationDate = null;
+                part.ContentDisposition.ReadDate = null;
+                part.ContentDisposition.Parameters.Remove("creation-date");
+                part.ContentDisposition.Parameters.Remove("modification-date");
+                part.ContentDisposition.Parameters.Remove("read-date");
+            }
+            if (!string.IsNullOrEmpty(part.FileName))
+            {
+                part.FileName = Path.GetFileName(part.FileName);
+            }
+        }
 
         return senderDomain;
     }
@@ -50,12 +80,36 @@ public static class DirectMxSmtpService
         Action<string>? onProgress = null,
         CancellationToken cancellationToken = default)
     {
+        var fromMailbox = new MailboxAddress(account.Username, account.EmailAddress);
+        await SendCustomAsync(
+            fromMailbox,
+            toAddress,
+            subject,
+            body,
+            isHtml,
+            attachmentPath,
+            isolationKey: account.Id,
+            onProgress,
+            cancellationToken);
+    }
+
+    public static async Task SendCustomAsync(
+        MailboxAddress fromMailbox,
+        string toAddress,
+        string subject,
+        string body,
+        bool isHtml = false,
+        string? attachmentPath = null,
+        string? isolationKey = null,
+        Action<string>? onProgress = null,
+        CancellationToken cancellationToken = default)
+    {
         var sw = Stopwatch.StartNew();
         if (string.IsNullOrWhiteSpace(toAddress))
             throw new ArgumentException("Recipient address is required.", nameof(toAddress));
 
         var message = new MimeMessage();
-        message.From.Add(new MailboxAddress(account.Username, account.EmailAddress));
+        message.From.Add(fromMailbox);
         message.To.Add(MailboxAddress.Parse(toAddress));
         message.Subject = subject ?? string.Empty;
 
@@ -70,16 +124,18 @@ public static class DirectMxSmtpService
 
         message.Body = builder.ToMessageBody();
 
-        string senderDomain = SanitizeMessageForAnonymity(account, message);
+        string senderDomain = SanitizeMessageForAnonymity(message, ExtractDomain(fromMailbox.Address, "localhost"));
         var senderMailbox = message.From.Mailboxes.First();
         var recipientMailbox = message.To.Mailboxes.First();
         string recipientDomain = ExtractDomain(recipientMailbox.Address, string.Empty);
 
+        string effectiveIsolationKey = isolationKey ?? senderMailbox.Address;
+
         onProgress?.Invoke($"Resolving MX for '{recipientDomain}' over Tor DoH...");
-        var mxHosts = await ResolveMxOverTorAsync(account.Id, recipientDomain, cancellationToken);
+        var mxHosts = await ResolveMxOverTorAsync(effectiveIsolationKey, recipientDomain, cancellationToken);
         onProgress?.Invoke($"Found MX host(s): {string.Join(", ", mxHosts)}");
 
-        await DeliverToDomainOverTorAsync(account, senderDomain, senderMailbox, [recipientMailbox], mxHosts, message, onProgress, cancellationToken);
+        await DeliverToDomainOverTorAsync(effectiveIsolationKey, senderDomain, senderMailbox, [recipientMailbox], mxHosts, message, onProgress, cancellationToken);
         onProgress?.Invoke($"Mail sent successfully in {sw.ElapsedMilliseconds}ms.");
     }
 
@@ -155,7 +211,7 @@ public static class DirectMxSmtpService
     }
 
     static async Task DeliverToDomainOverTorAsync(
-        MailAccount account,
+        string circuitIsolationKey,
         string senderDomain,
         MailboxAddress senderMailbox,
         IReadOnlyList<MailboxAddress> recipients,
@@ -171,11 +227,11 @@ public static class DirectMxSmtpService
             if (rotation > 0)
             {
                 onProgress?.Invoke($"Tor circuit exit blocked port 25. Rotating circuit (attempt {rotation + 1}/{MaxCircuitRotationsPerDomain})...");
-                TorService.RotateCircuit(account.Id);
+                TorService.RotateCircuit(circuitIsolationKey);
             }
 
             var endpoint = await TorService.RequireEndpointAsync(cancellationToken);
-            int epoch = TorService.CircuitEpochOf(account.Id);
+            int epoch = TorService.CircuitEpochOf(circuitIsolationKey);
 
             foreach (string mxHost in mxHosts)
             {
@@ -192,7 +248,7 @@ public static class DirectMxSmtpService
                         CheckCertificateRevocation = false,
                         ServerCertificateValidationCallback = static (_, _, _, _) => true,
                         LocalDomain = senderDomain,
-                        ProxyClient = TorService.CreateProxy(endpoint, account.Id)
+                        ProxyClient = TorService.CreateProxy(endpoint, circuitIsolationKey)
                     };
 
                     using var stepBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

@@ -23,6 +23,11 @@ internal static class ApplicationServices
                 return;
 
             Directory.CreateDirectory(AppPaths.UserData);
+            string oldJsonPath = Path.Combine(AppPaths.UserData, "settings.json");
+            if (!File.Exists(ConfigPath) && File.Exists(oldJsonPath))
+            {
+                try { File.Copy(oldJsonPath, ConfigPath, true); } catch { }
+            }
             SettingsManager.LoadSettings(ConfigPath);
             Logger.ActivateLogging = Settings.EnableLogging.Value;
             LocManager.Init(Settings.Language.Value);
@@ -61,7 +66,7 @@ internal static class ApplicationServices
         if (persist)
         {
             Settings.Language.Value = language;
-            SettingsManager.SaveSettings(ConfigFileName);
+            SettingsManager.SaveSettings(ConfigPath);
         }
         if (IsLogEnabled)
             Log($"Language changed; selection={language}; active={LocManager.Current}; persisted={persist}", isRun: IsLogEnabled);

@@ -7,7 +7,7 @@ internal static class AppConstants
 
     public const string AppTitle = "AnonymMailClient";
     public const string AppVersion = "1.0.0";
-    public const string ConfigFileName = "settings.json";
+    public const string ConfigFileName = "settings.txt";
 
     public static readonly string ThisExePath = Environment.ProcessPath ?? AppContext.BaseDirectory;
     public static readonly string ThisExeFolder = Path.GetDirectoryName(ThisExePath) ?? AppContext.BaseDirectory;
