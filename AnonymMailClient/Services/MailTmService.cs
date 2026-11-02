@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
@@ -13,24 +12,20 @@ namespace AnonymMailClient.Services;
 
 /// <summary>
 /// Service for interacting with Mail.tm (https://api.mail.tm) strictly over Tor SOCKS5.
-/// Supports account provisioning, domain listing, JWT token management, message polling, and detail retrieval.
+/// Fully stateless zero-session architecture: No JWT tokens or sessions are persisted to disk or cached across operations.
+/// Every request connects via an isolated, unique Tor circuit with brand-new exit IP and SOCKS credentials.
 /// </summary>
 public static class MailTmService
 {
     const bool IsLogEnabled = true;
     const string BaseUrl = "https://api.mail.tm";
 
-    sealed record TokenEntry(string Token, string AccountRemoteId, DateTime ObtainedUtc);
-
-    static readonly ConcurrentDictionary<string, TokenEntry> TokensByAccountId = new(StringComparer.OrdinalIgnoreCase);
-    static readonly TimeSpan TokenLifetime = TimeSpan.FromMinutes(45);
-
-    public static async Task<IReadOnlyList<string>> GetDomainsAsync(string isolationKey = "mailtm_discovery", CancellationToken cancellationToken = default)
+    public static async Task<IReadOnlyList<string>> GetDomainsAsync(CancellationToken cancellationToken = default)
     {
         var sw = Stopwatch.StartNew();
-        Log($"MailTm.GetDomainsAsync started; isolationKey='{isolationKey}'", isRun: IsLogEnabled);
+        Log("MailTm.GetDomainsAsync started over fresh Tor circuit", isRun: IsLogEnabled);
 
-        using var client = TorService.CreateIsolatedHttpClient(isolationKey, timeout: TimeSpan.FromSeconds(35));
+        using var client = TorService.CreateIsolatedHttpClient(timeout: TimeSpan.FromSeconds(35));
         using var request = new HttpRequestMessage(HttpMethod.Get, $"{BaseUrl}/domains");
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/ld+json"));
 
@@ -58,16 +53,14 @@ public static class MailTmService
         string? desiredUsername,
         string? desiredDomain,
         string? password = null,
-        string? isolationKey = null,
         CancellationToken cancellationToken = default)
     {
         var sw = Stopwatch.StartNew();
-        string key = isolationKey ?? Guid.NewGuid().ToString("N");
 
         string domain = desiredDomain?.Trim().ToLowerInvariant() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(domain))
         {
-            var domains = await GetDomainsAsync(key, cancellationToken);
+            var domains = await GetDomainsAsync(cancellationToken);
             domain = domains.FirstOrDefault() ?? throw new InvalidOperationException("Mail.tm returned no active domains.");
         }
 
@@ -80,9 +73,9 @@ public static class MailTmService
             : GenerateSecurePassword();
 
         string email = $"{username}@{domain}";
-        Log($"MailTm.CreateAccountAsync started for '{email}'", isRun: IsLogEnabled);
+        Log($"MailTm.CreateAccountAsync started for '{email}' over fresh Tor circuit", isRun: IsLogEnabled);
 
-        using var client = TorService.CreateIsolatedHttpClient(key, timeout: TimeSpan.FromSeconds(40));
+        using var client = TorService.CreateIsolatedHttpClient(timeout: TimeSpan.FromSeconds(40));
         string payload = JsonSerializer.Serialize(new { address = email, password = finalPassword });
 
         using (var createReq = new HttpRequestMessage(HttpMethod.Post, $"{BaseUrl}/accounts")
@@ -100,7 +93,7 @@ public static class MailTmService
             }
         }
 
-        var tokenEntry = await ObtainTokenAsync(client, email, finalPassword, cancellationToken);
+        var tokenEntry = await ObtainEphemeralTokenAsync(client, email, finalPassword, cancellationToken);
 
         var account = new MailAccount
         {
@@ -114,7 +107,6 @@ public static class MailTmService
             CreatedAtUtc = DateTime.UtcNow
         };
 
-        TokensByAccountId[account.Id] = tokenEntry;
         Log($"MailTm.CreateAccountAsync succeeded for '{email}' in {sw.ElapsedMilliseconds}ms", isRun: IsLogEnabled);
         return account;
     }
@@ -122,12 +114,20 @@ public static class MailTmService
     public static async Task<IReadOnlyList<MailMessageSummary>> CheckMessagesAsync(MailAccount account, CancellationToken cancellationToken = default)
     {
         var sw = Stopwatch.StartNew();
-        using var client = TorService.CreateIsolatedHttpClient(account.Id, timeout: TimeSpan.FromSeconds(35));
-        string token = await EnsureBearerTokenAsync(client, account, forceRefresh: false, cancellationToken);
+        if (string.IsNullOrWhiteSpace(account.Password))
+            throw new InvalidOperationException($"No password stored for Mail.tm account '{account.EmailAddress}'.");
 
-        using var response = await SendAuthorizedAsync(client, account, HttpMethod.Get, $"{BaseUrl}/messages?page=1", null, token, cancellationToken);
+        using var client = TorService.CreateIsolatedHttpClient(timeout: TimeSpan.FromSeconds(35));
+        var tokenEntry = await ObtainEphemeralTokenAsync(client, account.EmailAddress, account.Password, cancellationToken);
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, $"{BaseUrl}/messages?page=1");
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokenEntry.Token);
+        req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/ld+json"));
+
+        using var response = await client.SendAsync(req, cancellationToken);
+        response.EnsureSuccessStatusCode();
+
         string json = await response.Content.ReadAsStringAsync(cancellationToken);
-
         using var doc = JsonDocument.Parse(json);
         var result = new List<MailMessageSummary>();
 
@@ -167,43 +167,53 @@ public static class MailTmService
 
         account.LastCheckedUtc = DateTime.UtcNow;
         account.UnreadCount = result.Count(static m => !m.IsRead);
-        Log($"MailTm.CheckMessagesAsync: account='{account.EmailAddress}', found={result.Count} msgs, unread={account.UnreadCount} ({sw.ElapsedMilliseconds}ms)", isRun: IsLogEnabled);
+        Log($"MailTm.CheckMessagesAsync: account='{account.EmailAddress}', found={result.Count} msgs, unread={account.UnreadCount} in {sw.ElapsedMilliseconds}ms (circuit discarded)", isRun: IsLogEnabled);
         return result;
     }
 
     public static async Task<MailMessageSummary> FetchMessageDetailAsync(MailAccount account, string messageId, CancellationToken cancellationToken = default)
     {
         var sw = Stopwatch.StartNew();
-        using var client = TorService.CreateIsolatedHttpClient(account.Id, timeout: TimeSpan.FromSeconds(40));
-        string token = await EnsureBearerTokenAsync(client, account, forceRefresh: false, cancellationToken);
+        if (string.IsNullOrWhiteSpace(account.Password))
+            throw new InvalidOperationException($"No password stored for Mail.tm account '{account.EmailAddress}'.");
+
+        using var client = TorService.CreateIsolatedHttpClient(timeout: TimeSpan.FromSeconds(40));
+        var tokenEntry = await ObtainEphemeralTokenAsync(client, account.EmailAddress, account.Password, cancellationToken);
 
         // Try raw MIME source download first
         try
         {
-            using var sourceResp = await SendAuthorizedAsync(client, account, HttpMethod.Get, $"{BaseUrl}/sources/{Uri.EscapeDataString(messageId)}", null, token, cancellationToken);
-            string sourceJson = await sourceResp.Content.ReadAsStringAsync(cancellationToken);
-            using var sourceDoc = JsonDocument.Parse(sourceJson);
-            string rawMime = ReadString(sourceDoc.RootElement, "data");
+            using var sourceReq = new HttpRequestMessage(HttpMethod.Get, $"{BaseUrl}/sources/{Uri.EscapeDataString(messageId)}");
+            sourceReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokenEntry.Token);
+            sourceReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/ld+json"));
 
-            if (!string.IsNullOrWhiteSpace(rawMime))
+            using var sourceResp = await client.SendAsync(sourceReq, cancellationToken);
+            if (sourceResp.IsSuccessStatusCode)
             {
-                await using var rawStream = new MemoryStream(Encoding.UTF8.GetBytes(rawMime));
-                var parsedMime = await MimeMessage.LoadAsync(rawStream, cancellationToken);
+                string sourceJson = await sourceResp.Content.ReadAsStringAsync(cancellationToken);
+                using var sourceDoc = JsonDocument.Parse(sourceJson);
+                string rawMime = ReadString(sourceDoc.RootElement, "data");
 
-                string body = !string.IsNullOrWhiteSpace(parsedMime.TextBody)
-                    ? parsedMime.TextBody
-                    : (parsedMime.HtmlBody ?? "(Empty message body)");
-
-                return new MailMessageSummary
+                if (!string.IsNullOrWhiteSpace(rawMime))
                 {
-                    Id = messageId,
-                    AccountId = account.Id,
-                    From = parsedMime.From.ToString(),
-                    Subject = parsedMime.Subject ?? "(No Subject)",
-                    DateUtc = parsedMime.Date.UtcDateTime,
-                    IsRead = true,
-                    BodyText = body
-                };
+                    await using var rawStream = new MemoryStream(Encoding.UTF8.GetBytes(rawMime));
+                    var parsedMime = await MimeMessage.LoadAsync(rawStream, cancellationToken);
+
+                    string body = !string.IsNullOrWhiteSpace(parsedMime.TextBody)
+                        ? parsedMime.TextBody
+                        : (parsedMime.HtmlBody ?? "(Empty message body)");
+
+                    return new MailMessageSummary
+                    {
+                        Id = messageId,
+                        AccountId = account.Id,
+                        From = parsedMime.From.ToString(),
+                        Subject = parsedMime.Subject ?? "(No Subject)",
+                        DateUtc = parsedMime.Date.UtcDateTime,
+                        IsRead = true,
+                        BodyText = body
+                    };
+                }
             }
         }
         catch (Exception ex)
@@ -212,7 +222,13 @@ public static class MailTmService
         }
 
         // Fallback to JSON /messages/{id}
-        using var msgResp = await SendAuthorizedAsync(client, account, HttpMethod.Get, $"{BaseUrl}/messages/{Uri.EscapeDataString(messageId)}", null, token, cancellationToken);
+        using var msgReq = new HttpRequestMessage(HttpMethod.Get, $"{BaseUrl}/messages/{Uri.EscapeDataString(messageId)}");
+        msgReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokenEntry.Token);
+        msgReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/ld+json"));
+
+        using var msgResp = await client.SendAsync(msgReq, cancellationToken);
+        msgResp.EnsureSuccessStatusCode();
+
         string msgJson = await msgResp.Content.ReadAsStringAsync(cancellationToken);
         using var msgDoc = JsonDocument.Parse(msgJson);
         var root = msgDoc.RootElement;
@@ -227,7 +243,7 @@ public static class MailTmService
         if (DateTimeOffset.TryParse(ReadString(root, "createdAt"), out var p))
             dt = p.UtcDateTime;
 
-        Log($"MailTm.FetchMessageDetailAsync completed for {messageId} in {sw.ElapsedMilliseconds}ms", isRun: IsLogEnabled);
+        Log($"MailTm.FetchMessageDetailAsync completed for {messageId} in {sw.ElapsedMilliseconds}ms (circuit discarded)", isRun: IsLogEnabled);
         return new MailMessageSummary
         {
             Id = messageId,
@@ -242,63 +258,21 @@ public static class MailTmService
 
     public static async Task DeleteMessageAsync(MailAccount account, string messageId, CancellationToken cancellationToken = default)
     {
-        using var client = TorService.CreateIsolatedHttpClient(account.Id, timeout: TimeSpan.FromSeconds(30));
-        string token = await EnsureBearerTokenAsync(client, account, forceRefresh: false, cancellationToken);
-        using var resp = await SendAuthorizedAsync(client, account, HttpMethod.Delete, $"{BaseUrl}/messages/{Uri.EscapeDataString(messageId)}", null, token, cancellationToken);
-    }
-
-    static async Task<HttpResponseMessage> SendAuthorizedAsync(
-        HttpClient client,
-        MailAccount account,
-        HttpMethod method,
-        string url,
-        HttpContent? content,
-        string token,
-        CancellationToken cancellationToken)
-    {
-        using var req = new HttpRequestMessage(method, url) { Content = content };
-        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/ld+json"));
-
-        var resp = await client.SendAsync(req, cancellationToken);
-        if (resp.StatusCode == HttpStatusCode.Unauthorized)
-        {
-            resp.Dispose();
-            string refreshed = await EnsureBearerTokenAsync(client, account, forceRefresh: true, cancellationToken);
-            using var retryReq = new HttpRequestMessage(method, url);
-            if (content != null)
-            {
-                string bytes = await content.ReadAsStringAsync(cancellationToken);
-                retryReq.Content = new StringContent(bytes, Encoding.UTF8, content.Headers.ContentType?.MediaType ?? "application/json");
-            }
-            retryReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", refreshed);
-            retryReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/ld+json"));
-            resp = await client.SendAsync(retryReq, cancellationToken);
-        }
-
-        resp.EnsureSuccessStatusCode();
-        return resp;
-    }
-
-    static async Task<string> EnsureBearerTokenAsync(HttpClient client, MailAccount account, bool forceRefresh, CancellationToken cancellationToken)
-    {
-        if (!forceRefresh &&
-            TokensByAccountId.TryGetValue(account.Id, out var cached) &&
-            DateTime.UtcNow - cached.ObtainedUtc < TokenLifetime &&
-            !string.IsNullOrWhiteSpace(cached.Token))
-        {
-            return cached.Token;
-        }
-
         if (string.IsNullOrWhiteSpace(account.Password))
-            throw new InvalidOperationException($"No password available for Mail.tm account '{account.EmailAddress}'.");
+            throw new InvalidOperationException($"No password stored for Mail.tm account '{account.EmailAddress}'.");
 
-        var entry = await ObtainTokenAsync(client, account.EmailAddress, account.Password, cancellationToken);
-        TokensByAccountId[account.Id] = entry;
-        return entry.Token;
+        using var client = TorService.CreateIsolatedHttpClient(timeout: TimeSpan.FromSeconds(30));
+        var tokenEntry = await ObtainEphemeralTokenAsync(client, account.EmailAddress, account.Password, cancellationToken);
+
+        using var req = new HttpRequestMessage(HttpMethod.Delete, $"{BaseUrl}/messages/{Uri.EscapeDataString(messageId)}");
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokenEntry.Token);
+        using var resp = await client.SendAsync(req, cancellationToken);
+        resp.EnsureSuccessStatusCode();
     }
 
-    static async Task<TokenEntry> ObtainTokenAsync(HttpClient client, string email, string password, CancellationToken cancellationToken)
+    sealed record EphemeralToken(string Token, string AccountRemoteId);
+
+    static async Task<EphemeralToken> ObtainEphemeralTokenAsync(HttpClient client, string email, string password, CancellationToken cancellationToken)
     {
         string payload = JsonSerializer.Serialize(new { address = email, password });
         using var req = new HttpRequestMessage(HttpMethod.Post, $"{BaseUrl}/token")
@@ -324,7 +298,7 @@ public static class MailTmService
         if (string.IsNullOrWhiteSpace(token))
             throw new InvalidOperationException("Mail.tm returned an empty authentication token.");
 
-        return new TokenEntry(token, remoteId, DateTime.UtcNow);
+        return new EphemeralToken(token, remoteId);
     }
 
     public static string GenerateSecurePassword(int length = 20)

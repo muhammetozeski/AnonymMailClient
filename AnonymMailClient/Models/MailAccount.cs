@@ -10,7 +10,6 @@ public sealed class MailAccount
     public string EmailAddress { get; set; } = string.Empty;
     public string Username { get; set; } = string.Empty;
     public string Domain { get; set; } = "sharklasers.com";
-    public string SidToken { get; set; } = string.Empty;
     public string? Password { get; set; }
     public string? RemoteAccountId { get; set; }
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;

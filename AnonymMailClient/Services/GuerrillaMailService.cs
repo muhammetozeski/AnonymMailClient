@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
@@ -8,6 +7,11 @@ using AnonymMailClient.Tor;
 
 namespace AnonymMailClient.Services;
 
+/// <summary>
+/// Service for interacting with Guerrilla Mail (https://api.guerrillamail.com/ajax.php) over Tor SOCKS5.
+/// Fully stateless zero-session architecture: No sid_token is ever persisted to disk or stored across requests.
+/// Every operation uses a fresh HttpClient connected via an isolated, unique Tor circuit with ephemeral session negotiation.
+/// </summary>
 public static class GuerrillaMailService
 {
     const bool IsLogEnabled = true;
@@ -24,43 +28,33 @@ public static class GuerrillaMailService
         "pokemail.net"
     ];
 
-    sealed record SessionState(string SidToken, string EmailUser, DateTime ClaimedUtc);
-    static readonly ConcurrentDictionary<string, SessionState> sessionsByKey = new(StringComparer.OrdinalIgnoreCase);
-    static readonly TimeSpan SessionRefreshWindow = TimeSpan.FromMinutes(10);
-
     public static async Task<MailAccount> CreateRandomAccountAsync(string? domain = null, CancellationToken cancellationToken = default)
     {
         domain = string.IsNullOrWhiteSpace(domain) ? AvailableDomains[0] : domain.Trim().ToLowerInvariant();
-        string tempKey = Guid.NewGuid().ToString("N");
 
         Log($"GuerrillaMail: Creating random account on domain '{domain}'...", isRun: IsLogEnabled);
-        using var client = TorService.CreateIsolatedHttpClient(tempKey);
+        using var client = TorService.CreateIsolatedHttpClient();
 
         string url = $"{EndpointUrl}?f=get_email_address&lang=en";
         string json = await client.GetStringAsync(url, cancellationToken);
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
-        string sidToken = root.TryGetProperty("sid_token", out var sid) ? sid.GetString() ?? string.Empty : string.Empty;
         string addr = root.TryGetProperty("email_addr", out var a) ? a.GetString() ?? string.Empty : string.Empty;
 
         int atIndex = addr.IndexOf('@');
         string emailUser = atIndex > 0 ? addr[..atIndex] : ("anon" + Random.Shared.Next(10000, 99999));
 
-        // Re-claim with set_email_user to solidify the session
-        sidToken = await ClaimUsernameAsync(client, emailUser, sidToken, cancellationToken);
-
         var account = new MailAccount
         {
-            Id = tempKey,
+            Id = Guid.NewGuid().ToString("N"),
+            Provider = "guerrilla",
             Username = emailUser,
             Domain = domain,
             EmailAddress = $"{emailUser}@{domain}",
-            SidToken = sidToken,
             CreatedAtUtc = DateTime.UtcNow
         };
 
-        sessionsByKey[account.Id] = new SessionState(sidToken, emailUser, DateTime.UtcNow);
         Log($"GuerrillaMail: Created random account '{account.EmailAddress}'.", isRun: IsLogEnabled);
         return account;
     }
@@ -69,24 +63,22 @@ public static class GuerrillaMailService
     {
         domain = string.IsNullOrWhiteSpace(domain) ? AvailableDomains[0] : domain.Trim().ToLowerInvariant();
         string emailUser = SanitizeUsername(username);
-        string tempKey = Guid.NewGuid().ToString("N");
 
         Log($"GuerrillaMail: Claiming custom account '{emailUser}@{domain}'...", isRun: IsLogEnabled);
-        using var client = TorService.CreateIsolatedHttpClient(tempKey);
+        using var client = TorService.CreateIsolatedHttpClient();
 
-        string sidToken = await ClaimUsernameAsync(client, emailUser, null, cancellationToken);
+        await ClaimUsernameEphemeralAsync(client, emailUser, cancellationToken);
 
         var account = new MailAccount
         {
-            Id = tempKey,
+            Id = Guid.NewGuid().ToString("N"),
+            Provider = "guerrilla",
             Username = emailUser,
             Domain = domain,
             EmailAddress = $"{emailUser}@{domain}",
-            SidToken = sidToken,
             CreatedAtUtc = DateTime.UtcNow
         };
 
-        sessionsByKey[account.Id] = new SessionState(sidToken, emailUser, DateTime.UtcNow);
         Log($"GuerrillaMail: Claimed custom account '{account.EmailAddress}'.", isRun: IsLogEnabled);
         return account;
     }
@@ -94,55 +86,55 @@ public static class GuerrillaMailService
     public static async Task<IReadOnlyList<MailMessageSummary>> CheckMessagesAsync(MailAccount account, CancellationToken cancellationToken = default)
     {
         var sw = Stopwatch.StartNew();
-        Log($"GuerrillaMail: Checking messages for '{account.EmailAddress}'...", isRun: IsLogEnabled);
+        Log($"GuerrillaMail: Checking messages for '{account.EmailAddress}' over fresh Tor circuit...", isRun: IsLogEnabled);
 
-        using var client = TorService.CreateIsolatedHttpClient(account.Id);
-        string sidToken = await EnsureSessionAsync(client, account, forceReclaim: false, cancellationToken);
+        using var client = TorService.CreateIsolatedHttpClient();
+        string ephemeralSid = await ClaimUsernameEphemeralAsync(client, account.Username, cancellationToken);
 
-        string url = $"{EndpointUrl}?f=get_email_list&offset=0&sid_token={Uri.EscapeDataString(sidToken)}";
+        string url = $"{EndpointUrl}?f=get_email_list&offset=0&sid_token={Uri.EscapeDataString(ephemeralSid)}";
         string json = await client.GetStringAsync(url, cancellationToken);
 
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
         var items = new List<MailMessageSummary>();
-        if (!root.TryGetProperty("list", out var listElement) || listElement.ValueKind != JsonValueKind.Array)
-            return items;
-
-        foreach (var entry in listElement.EnumerateArray())
+        if (root.TryGetProperty("list", out var listElement) && listElement.ValueKind == JsonValueKind.Array)
         {
-            string mailId = ReadStringOrNumber(entry, "mail_id");
-            if (string.IsNullOrWhiteSpace(mailId)) continue;
-
-            string rawFrom = ReadString(entry, "mail_from");
-            string subject = WebUtility.HtmlDecode(ReadString(entry, "mail_subject"));
-            string excerpt = WebUtility.HtmlDecode(ReadString(entry, "mail_excerpt"));
-            string readStr = ReadStringOrNumber(entry, "mail_read");
-            string attStr = ReadStringOrNumber(entry, "att");
-            long timestamp = ReadLong(entry, "mail_timestamp");
-
-            DateTime dateUtc = timestamp > 0
-                ? DateTimeOffset.FromUnixTimeSeconds(timestamp).UtcDateTime
-                : DateTime.UtcNow;
-
-            items.Add(new MailMessageSummary
+            foreach (var entry in listElement.EnumerateArray())
             {
-                Id = mailId,
-                AccountId = account.Id,
-                From = rawFrom,
-                To = account.EmailAddress,
-                Subject = string.IsNullOrWhiteSpace(subject) ? "(No Subject)" : subject,
-                Excerpt = excerpt,
-                DateUtc = dateUtc,
-                IsRead = readStr == "1",
-                HasAttachments = attStr != "0" && !string.IsNullOrEmpty(attStr)
-            });
+                string mailId = ReadStringOrNumber(entry, "mail_id");
+                if (string.IsNullOrWhiteSpace(mailId)) continue;
+
+                string rawFrom = ReadString(entry, "mail_from");
+                string subject = WebUtility.HtmlDecode(ReadString(entry, "mail_subject"));
+                string excerpt = WebUtility.HtmlDecode(ReadString(entry, "mail_excerpt"));
+                string readStr = ReadStringOrNumber(entry, "mail_read");
+                string attStr = ReadStringOrNumber(entry, "att");
+                long timestamp = ReadLong(entry, "mail_timestamp");
+
+                DateTime dateUtc = timestamp > 0
+                    ? DateTimeOffset.FromUnixTimeSeconds(timestamp).UtcDateTime
+                    : DateTime.UtcNow;
+
+                items.Add(new MailMessageSummary
+                {
+                    Id = mailId,
+                    AccountId = account.Id,
+                    From = rawFrom,
+                    To = account.EmailAddress,
+                    Subject = string.IsNullOrWhiteSpace(subject) ? "(No Subject)" : subject,
+                    Excerpt = excerpt,
+                    DateUtc = dateUtc,
+                    IsRead = readStr == "1",
+                    HasAttachments = attStr != "0" && !string.IsNullOrEmpty(attStr)
+                });
+            }
         }
 
         account.LastCheckedUtc = DateTime.UtcNow;
         account.UnreadCount = items.Count(m => !m.IsRead);
 
-        Log($"GuerrillaMail: Checked '{account.EmailAddress}', found {items.Count} message(s) in {sw.ElapsedMilliseconds}ms.", isRun: IsLogEnabled);
+        Log($"GuerrillaMail: Checked '{account.EmailAddress}', found {items.Count} message(s) in {sw.ElapsedMilliseconds}ms (circuit discarded).", isRun: IsLogEnabled);
         return items;
     }
 
@@ -151,23 +143,14 @@ public static class GuerrillaMailService
         var sw = Stopwatch.StartNew();
         Log($"GuerrillaMail: Fetching message detail for id='{messageId}' on '{account.EmailAddress}'...", isRun: IsLogEnabled);
 
-        using var client = TorService.CreateIsolatedHttpClient(account.Id);
-        string sidToken = await EnsureSessionAsync(client, account, forceReclaim: false, cancellationToken);
+        using var client = TorService.CreateIsolatedHttpClient();
+        string ephemeralSid = await ClaimUsernameEphemeralAsync(client, account.Username, cancellationToken);
 
-        string url = $"{EndpointUrl}?f=fetch_email&email_id={Uri.EscapeDataString(messageId)}&sid_token={Uri.EscapeDataString(sidToken)}";
+        string url = $"{EndpointUrl}?f=fetch_email&email_id={Uri.EscapeDataString(messageId)}&sid_token={Uri.EscapeDataString(ephemeralSid)}";
         string json = await client.GetStringAsync(url, cancellationToken);
 
         using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-        if (root.ValueKind == JsonValueKind.False || !root.TryGetProperty("mail_id", out _))
-        {
-            sidToken = await EnsureSessionAsync(client, account, forceReclaim: true, cancellationToken);
-            url = $"{EndpointUrl}?f=fetch_email&email_id={Uri.EscapeDataString(messageId)}&sid_token={Uri.EscapeDataString(sidToken)}";
-            json = await client.GetStringAsync(url, cancellationToken);
-        }
-
-        using var retryDoc = JsonDocument.Parse(json);
-        var mail = retryDoc.RootElement;
+        var mail = doc.RootElement;
 
         string rawFrom = ReadString(mail, "mail_from");
         string subject = WebUtility.HtmlDecode(ReadString(mail, "mail_subject"));
@@ -189,19 +172,19 @@ public static class GuerrillaMailService
             IsRead = true
         };
 
-        Log($"GuerrillaMail: Fetched message '{messageId}' in {sw.ElapsedMilliseconds}ms.", isRun: IsLogEnabled);
+        Log($"GuerrillaMail: Fetched message '{messageId}' in {sw.ElapsedMilliseconds}ms (ephemeral session discarded).", isRun: IsLogEnabled);
         return summary;
     }
 
     public static async Task DeleteMessageAsync(MailAccount account, string messageId, CancellationToken cancellationToken = default)
     {
-        using var client = TorService.CreateIsolatedHttpClient(account.Id);
-        string sidToken = await EnsureSessionAsync(client, account, forceReclaim: false, cancellationToken);
+        using var client = TorService.CreateIsolatedHttpClient();
+        string ephemeralSid = await ClaimUsernameEphemeralAsync(client, account.Username, cancellationToken);
 
         var form = new List<KeyValuePair<string, string>>
         {
             new("f", "del_email"),
-            new("sid_token", sidToken),
+            new("sid_token", ephemeralSid),
             new("email_ids[]", messageId)
         };
 
@@ -211,26 +194,7 @@ public static class GuerrillaMailService
         Log($"GuerrillaMail: Deleted message '{messageId}' on '{account.EmailAddress}'.", isRun: IsLogEnabled);
     }
 
-    static async Task<string> EnsureSessionAsync(HttpClient client, MailAccount account, bool forceReclaim, CancellationToken cancellationToken)
-    {
-        string emailUser = account.Username;
-        if (!forceReclaim &&
-            sessionsByKey.TryGetValue(account.Id, out var cached) &&
-            string.Equals(cached.EmailUser, emailUser, StringComparison.OrdinalIgnoreCase) &&
-            DateTime.UtcNow - cached.ClaimedUtc < SessionRefreshWindow &&
-            !string.IsNullOrWhiteSpace(cached.SidToken))
-        {
-            return cached.SidToken;
-        }
-
-        string? initialSid = !string.IsNullOrWhiteSpace(account.SidToken) ? account.SidToken : null;
-        string sidToken = await ClaimUsernameAsync(client, emailUser, initialSid, cancellationToken);
-        account.SidToken = sidToken;
-        sessionsByKey[account.Id] = new SessionState(sidToken, emailUser, DateTime.UtcNow);
-        return sidToken;
-    }
-
-    static async Task<string> ClaimUsernameAsync(HttpClient client, string emailUser, string? existingSid, CancellationToken cancellationToken)
+    static async Task<string> ClaimUsernameEphemeralAsync(HttpClient client, string emailUser, CancellationToken cancellationToken)
     {
         var form = new List<KeyValuePair<string, string>>
         {
@@ -238,8 +202,6 @@ public static class GuerrillaMailService
             new("email_user", emailUser),
             new("lang", "en")
         };
-        if (!string.IsNullOrWhiteSpace(existingSid))
-            form.Add(new("sid_token", existingSid));
 
         using var content = new FormUrlEncodedContent(form);
         using var response = await client.PostAsync(EndpointUrl, content, cancellationToken);

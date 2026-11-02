@@ -45,27 +45,24 @@ public static partial class TorService
 
     #region Circuit isolation
 
-    static readonly ConcurrentDictionary<string, int> circuitEpochs = new();
-
-    public static int CircuitEpochOf(string isolationKey) => circuitEpochs.GetOrAdd(isolationKey, 1);
-
-    public static int RotateCircuit(string isolationKey)
+    public static NetworkCredential NewRandomCredentials()
     {
-        InvalidateExitLease(isolationKey);
-        int epoch = circuitEpochs.AddOrUpdate(isolationKey, 2, static (_, curr) => curr + 1);
-        Log($"Tor circuit rotated for '{isolationKey}' (epoch {epoch}).", isRun: IsLogEnabled);
-        return epoch;
+        return new NetworkCredential(Guid.NewGuid().ToString("N"), Guid.NewGuid().ToString("N"));
     }
 
-    public static NetworkCredential IsolationCredentials(string isolationKey)
+    public static int CircuitEpochOf(string? isolationKey = null) => 1;
+
+    public static int RotateCircuit(string? isolationKey = null)
     {
-        int epoch = CircuitEpochOf(isolationKey);
-        return new NetworkCredential($"user_{isolationKey}", $"epoch_{epoch}");
+        Log("Tor circuit rotated (every connection receives fresh isolated credentials).", isRun: IsLogEnabled);
+        return 1;
     }
 
-    public static IProxyClient CreateProxy(TorEndpoint endpoint, string isolationKey)
+    public static NetworkCredential IsolationCredentials(string? isolationKey = null) => NewRandomCredentials();
+
+    public static IProxyClient CreateProxy(TorEndpoint endpoint, string? isolationKey = null)
     {
-        var creds = IsolationCredentials(isolationKey);
+        var creds = NewRandomCredentials();
         return new TorSocks5Client(endpoint.Host, endpoint.Port, creds);
     }
 
